@@ -1,0 +1,11 @@
+/app/target/
+/target/
+/engine/.venv/
+/.scratch/
+/default.yaml
+/runtime/*.dll
+/runtime/*.dylib
+/engine/models/*.nemo
+/engine/models/*.onnx
+/engine/models/*.data
+/engine/models/decoder.safetensors

@@ -1,0 +1,36 @@
+{
+ "model": "third-intelligence/Haas-ja-v1.0",
+ "sample_rate": 16000,
+ "vocab_size": 3072,
+ "blank_id": 3072,
+ "num_classes_with_blank": 3078,
+ "durations": [
+  0,
+  1,
+  2,
+  3,
+  4
+ ],
+ "max_symbols": 10,
+ "hidden": 640,
+ "num_layers": 2,
+ "num_heads": 5,
+ "head_dim": 64,
+ "head_v_dim": 64,
+ "conv_size": 4,
+ "encoder_dim": 1024,
+ "frontend": "frontend.onnx",
+ "mel": {
+  "sample_rate": 16000,
+  "n_fft": 512,
+  "win_length": 400,
+  "hop_length": 160,
+  "n_mels": 128,
+  "preemph": 0.97,
+  "log_guard": 5.960464477539063e-08,
+  "pad_to": 16,
+  "pad_value": 0.0,
+  "center": true,
+  "pad_mode": "reflect"
+ }
+}
