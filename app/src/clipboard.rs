@@ -6,7 +6,7 @@
 //! all come back.
 
 use std::sync::Once;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
@@ -85,7 +85,20 @@ pub fn paste(text: &str, delay_ms: u64, restore: bool) -> Result<()> {
     }
     std::thread::sleep(Duration::from_millis(30));
     send_ctrl_v();
-    std::thread::sleep(Duration::from_millis(delay_ms));
+    // A terminal or an editor can read the clipboard long after Ctrl+V, and
+    // putting the old contents back before then pastes the wrong text. Wait
+    // out the grace period, but stop watching as soon as another program has
+    // taken the clipboard over: our text has been used, and that program's
+    // contents must not be overwritten by the restore.
+    let deadline = Instant::now() + Duration::from_millis(delay_ms);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Some(current) = read_text() {
+            if current != text {
+                return Ok(());
+            }
+        }
+    }
     if let Some(snapshot) = snapshot {
         snapshot.restore();
     }
@@ -94,8 +107,14 @@ pub fn paste(text: &str, delay_ms: u64, restore: bool) -> Result<()> {
 
 /// Read the clipboard's Unicode text, for diagnostics.
 pub fn get_text() -> String {
+    read_text().unwrap_or_default()
+}
+
+/// The clipboard's Unicode text, or `None` when the clipboard cannot be opened
+/// right now (another program is holding it).
+fn read_text() -> Option<String> {
     if !open_clipboard() {
-        return String::new();
+        return None;
     }
     let mut out = String::new();
     unsafe {
@@ -114,7 +133,7 @@ pub fn get_text() -> String {
         }
         let _ = CloseClipboard();
     }
-    out
+    Some(out)
 }
 
 /// Capture, replace and restore the clipboard; returns (before, after).

@@ -4,6 +4,5 @@ pub enum Status {
     Starting,
     Recording,
     Transcribing,
-    Typed,
     Error(String),
 }

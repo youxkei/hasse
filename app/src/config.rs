@@ -13,6 +13,9 @@ pub struct Config {
     pub audio: AudioConfig,
     pub models: ModelsConfig,
     pub paste: PasteConfig,
+    pub review: ReviewConfig,
+    pub bias: BiasConfig,
+    pub decode: DecodeConfig,
     /// Directory used to resolve relative paths. With no config file this is
     /// the executable's directory, so the app runs from anywhere.
     #[serde(skip)]
@@ -56,6 +59,29 @@ pub struct PasteConfig {
     pub delay_ms: u64,
     /// Put the previous clipboard contents back.
     pub restore_clipboard: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewConfig {
+    /// Show the transcript in the overlay and wait for Ctrl+Enter before
+    /// inserting it. This is where corrections are collected.
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BiasConfig {
+    /// Apply the phrases learned from earlier corrections.
+    pub enabled: bool,
+    /// Multiplier on each stored phrase weight.
+    pub weight: f32,
+    /// Phrases file. Empty uses `data_dir()/bias.yaml`.
+    pub file: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DecodeConfig {
+    /// Beam width for the label search. `1` is greedy decoding.
+    pub beam: usize,
 }
 
 impl Default for Config {
@@ -149,6 +175,40 @@ impl Config {
                 self.base_dir.join(path)
             }
         })
+    }
+
+    /// Where the learned phrases live.
+    pub fn bias_path(&self) -> PathBuf {
+        let file = self.bias.file.trim();
+        if file.is_empty() {
+            return Self::data_dir().join("bias.yaml");
+        }
+        let path = PathBuf::from(file);
+        if path.is_absolute() { path } else { self.base_dir.join(path) }
+    }
+
+    /// Per-user state (learned phrases and the correction log). It sits beside
+    /// the installed app rather than in it, so an upgrade keeps it.
+    pub fn data_dir() -> PathBuf {
+        #[cfg(windows)]
+        {
+            if let Some(appdata) = std::env::var_os("LOCALAPPDATA") {
+                return PathBuf::from(appdata).join("hasse");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home).join("Library/Application Support/hasse");
+            }
+        }
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(xdg).join("hasse");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".local/share/hasse");
+        }
+        exe_dir()
     }
 }
 

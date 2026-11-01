@@ -5,8 +5,11 @@
 //! It was validated to produce the same token ids as NeMo on real speech, and
 //! the Rust output is checked against the Python reference by `--wav`.
 //!
-//! The encoder runs in ONNX Runtime on the CPU.
+//! The encoder runs in ONNX Runtime on the CPU. `set_phrases` adds the weights
+//! learned from corrections to the joint logits, so words the user corrected
+//! compete on a more even footing with what the acoustics alone suggest.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -15,6 +18,7 @@ use ort::value::Tensor;
 use safetensors::SafeTensors;
 use serde::Deserialize;
 
+use crate::bias::{CompiledBias, Phrase, Tokenizer};
 use crate::mel::{MelFrontend, SAMPLE_RATE};
 
 const VOCAB_PIECES: usize = 3072;
@@ -80,6 +84,9 @@ pub struct Asr {
     _env: ort::environment::Environment,
     meta: Meta,
     vocab: Vec<String>,
+    tokenizer: Tokenizer,
+    bias: CompiledBias,
+    beam: usize,
     weights: Weights,
     mel: MelFrontend,
 }
@@ -124,14 +131,29 @@ impl Asr {
             .commit_from_file(dir.join("frontend.onnx"))
             .map_err(|e| anyhow::anyhow!("loading frontend.onnx: {e}"))?;
 
+        let tokenizer = Tokenizer::new(&vocab);
         Ok(Self {
             session,
             _env: env,
             meta,
             vocab,
+            tokenizer,
+            bias: CompiledBias::empty(),
+            beam: 4,
             weights,
             mel: MelFrontend::new(fb, window)?,
         })
+    }
+
+    /// Install the phrases learned from corrections. `scale` multiplies their
+    /// stored weights.
+    pub fn set_phrases(&mut self, phrases: &[Phrase], scale: f32) {
+        self.bias = CompiledBias::compile(phrases, &self.tokenizer, scale);
+    }
+
+    /// Set the label-search beam width. `1` selects greedy decoding.
+    pub fn set_beam(&mut self, beam: usize) {
+        self.beam = beam;
     }
 
     /// Transcribe mono 16 kHz audio. Long audio is cut at quiet points like
@@ -151,7 +173,7 @@ impl Asr {
             // chunk's leading word boundary does not become a space.
             text.push_str(&self.detokenize(&ids));
         }
-        Ok(text)
+        Ok(self.bias.rewrite(&text))
     }
 
     fn transcribe_chunk(&mut self, audio: &[f32]) -> Result<Vec<usize>> {
@@ -195,8 +217,17 @@ impl Asr {
         Ok(self.decode(&proj.0, proj.1, enc_len))
     }
 
-    /// Greedy TDT decoding over `enc_proj` laid out `[hidden][frames]`.
+    /// Decode `enc_proj` laid out `[hidden][frames]`.
     fn decode(&self, enc: &[f32], frames: usize, enc_len: usize) -> Vec<usize> {
+        if self.beam <= 1 {
+            self.decode_greedy(enc, frames, enc_len)
+        } else {
+            self.decode_beam(enc, frames, enc_len)
+        }
+    }
+
+    /// Greedy TDT decoding over `enc_proj` laid out `[hidden][frames]`.
+    fn decode_greedy(&self, enc: &[f32], frames: usize, enc_len: usize) -> Vec<usize> {
         let meta = &self.meta;
         let blank = meta.blank_id;
 
@@ -206,9 +237,12 @@ impl Asr {
         let mut t = 0usize;
         let mut last_ts: isize = -1;
         let mut last_lasts = 0usize;
+        // One slot per label; refilled from `out` before each joint step.
+        let mut bonus = vec![0.0f32; meta.num_classes_with_blank];
 
         while t < enc_len {
-            let (label, dur_idx) = self.joint(enc, t, frames, &pred_proj);
+            self.bias.fill(&out, &mut bonus);
+            let (label, dur_idx) = self.joint(enc, t, frames, &pred_proj, &bonus);
             let mut dur = meta.durations[dur_idx];
             if dur == 0 && label == blank {
                 dur = 1;
@@ -218,7 +252,7 @@ impl Asr {
 
             let mut label = label;
             while t < enc_len && label == blank {
-                let (l, d) = self.joint(enc, t, frames, &pred_proj);
+                let (l, d) = self.joint(enc, t, frames, &pred_proj, &bonus);
                 label = l;
                 dur = meta.durations[d];
                 if dur == 0 && label == blank {
@@ -258,8 +292,157 @@ impl Asr {
         out
     }
 
+    /// Label beam search over `enc_proj`. The duration still comes from the
+    /// joint's argmax, as in greedy decoding; only the label choice is
+    /// searched. That keeps the hypothesis bookkeeping manageable while
+    /// letting a path that the greedy step would have pruned compete on the
+    /// whole sequence. The best few complete hypotheses are then rescored
+    /// with the learned phrases' right-hand context and the winner returned.
+    fn decode_beam(&self, enc: &[f32], frames: usize, enc_len: usize) -> Vec<usize> {
+        let meta = &self.meta;
+        let blank = meta.blank_id;
+        let vocab_with_blank = meta.blank_id + 1;
+        let beam = self.beam.max(2);
+        // Each candidate label costs one prediction-network step, which is the
+        // dominant cost of the search. Two is enough to recover from a greedy
+        // mistake without multiplying that work.
+        const BRANCH: usize = 2;
+
+        struct Hyp {
+            score: f32,
+            state: State,
+            pred_proj: Vec<f32>,
+            emitted: Vec<usize>,
+            last_t: usize,
+            last_lasts: usize,
+        }
+
+        let mut start_state =
+            State::new(meta.num_layers, meta.num_heads, meta.head_dim, meta.conv_size);
+        let start_pred = self.project_pred(&self.prednet_step(&mut start_state, blank));
+        let mut buckets: HashMap<usize, Vec<Hyp>> = HashMap::new();
+        buckets.entry(0).or_default().push(Hyp {
+            score: 0.0,
+            state: start_state,
+            pred_proj: start_pred,
+            emitted: Vec::new(),
+            last_t: usize::MAX,
+            last_lasts: 0,
+        });
+
+        // Completed hypotheses, kept so that a learned phrase's right-hand
+        // context can break the ties the beam leaves at the end.
+        let mut found: Vec<(f32, Vec<usize>)> = Vec::new();
+        let mut bonus = vec![0.0f32; vocab_with_blank];
+
+        for t in 0..enc_len {
+            // A duration of 0 emits several labels at one frame, so the same
+            // frame is drained repeatedly. `max_symbols` bounds the rounds.
+            for _ in 0..=meta.max_symbols {
+                let Some(mut hyps) = buckets.remove(&t) else { break };
+                hyps.sort_by(|a, b| b.score.total_cmp(&a.score));
+                hyps.truncate(beam);
+
+                for hyp in hyps {
+                    let (mut label_logits, mut dur_logits) =
+                        self.joint_logits(enc, t, frames, &hyp.pred_proj);
+                    self.bias.fill(&hyp.emitted, &mut bonus);
+                    for (logit, extra) in label_logits.iter_mut().zip(bonus.iter()) {
+                        *logit += extra;
+                    }
+                    log_softmax(&mut label_logits);
+                    log_softmax(&mut dur_logits);
+
+                    let dur_idx = argmax(&dur_logits);
+                    let dur = meta.durations[dur_idx];
+                    let dur_score = dur_logits[dur_idx];
+
+                    // Blank: no label, then move on.
+                    let next_t = if dur == 0 { t + 1 } else { t + dur };
+                    let score = hyp.score + label_logits[blank] + dur_score;
+                    if next_t >= enc_len {
+                        keep_best(&mut found, score, hyp.emitted.clone());
+                    } else {
+                        buckets.entry(next_t).or_default().push(Hyp {
+                            score,
+                            state: hyp.state.clone(),
+                            pred_proj: hyp.pred_proj.clone(),
+                            emitted: hyp.emitted.clone(),
+                            last_t: hyp.last_t,
+                            last_lasts: hyp.last_lasts,
+                        });
+                    }
+
+                    // Non-blank: emit a label and advance the prediction
+                    // network. Only the best few labels are kept.
+                    let mut candidates: Vec<(usize, f32)> =
+                        (0..blank).map(|i| (i, label_logits[i])).collect();
+                    candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    candidates.truncate(BRANCH);
+
+                    for (label, label_score) in candidates {
+                        let mut next_state = hyp.state.clone();
+                        let next_pred =
+                            self.project_pred(&self.prednet_step(&mut next_state, label));
+                        let mut emitted = hyp.emitted.clone();
+                        emitted.push(label);
+                        let score = hyp.score + label_score + dur_score;
+                        let (last_t, last_lasts) = if hyp.last_t == t {
+                            (t, hyp.last_lasts + 1)
+                        } else {
+                            (t, 1)
+                        };
+                        let next_t = if dur == 0 && last_lasts < meta.max_symbols {
+                            t
+                        } else {
+                            t + dur.max(1)
+                        };
+                        if next_t >= enc_len {
+                            keep_best(&mut found, score, emitted);
+                        } else {
+                            buckets.entry(next_t).or_default().push(Hyp {
+                                score,
+                                state: next_state,
+                                pred_proj: next_pred,
+                                emitted,
+                                last_t,
+                                last_lasts,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Hypotheses that never reached the last frame are still candidates.
+        for (_, hyps) in buckets {
+            for hyp in hyps {
+                keep_best(&mut found, hyp.score, hyp.emitted);
+            }
+        }
+
+        // A phrase's learned continuation is scored here, on whole
+        // hypotheses: the search could not see it when the phrase was
+        // emitted, but a path that then continued the way the user did wins
+        // over one that did not.
+        found
+            .into_iter()
+            .map(|(score, emitted)| (score + self.bias.right_bonus(&emitted), emitted))
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, emitted)| emitted)
+            .unwrap_or_default()
+    }
+
     /// Joint network argmax: (vocab label including blank, duration index).
-    fn joint(&self, enc: &[f32], t: usize, frames: usize, pred_proj: &[f32]) -> (usize, usize) {
+    /// `bonus` adds the learned phrase weights to the label logits.
+    fn joint(
+        &self,
+        enc: &[f32],
+        t: usize,
+        frames: usize,
+        pred_proj: &[f32],
+        bonus: &[f32],
+    ) -> (usize, usize) {
         let hidden_dim = self.meta.hidden;
         let n_out = self.meta.num_classes_with_blank;
         let vocab_with_blank = self.meta.blank_id + 1;
@@ -282,8 +465,9 @@ impl Asr {
                 acc += row[i] * act[i];
             }
             if d < vocab_with_blank {
-                if acc > best_score {
-                    best_score = acc;
+                let score = acc + bonus[d];
+                if score > best_score {
+                    best_score = score;
                     best_label = d;
                 }
             } else {
@@ -295,6 +479,43 @@ impl Asr {
             }
         }
         (best_label, best_dur)
+    }
+
+    /// Full label and duration logits for one frame. `decode_beam` needs the
+    /// scores, not just the argmax.
+    fn joint_logits(
+        &self,
+        enc: &[f32],
+        t: usize,
+        frames: usize,
+        pred_proj: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let hidden_dim = self.meta.hidden;
+        let n_out = self.meta.num_classes_with_blank;
+        let vocab_with_blank = self.meta.blank_id + 1;
+        let n_dur = self.meta.durations.len();
+
+        let mut act = vec![0.0f32; hidden_dim];
+        for d in 0..hidden_dim {
+            let v = enc[d * frames + t] + pred_proj[d];
+            act[d] = if v > 0.0 { v } else { 0.0 };
+        }
+
+        let mut labels = vec![0.0f32; vocab_with_blank];
+        let mut durations = vec![0.0f32; n_dur];
+        for d in 0..n_out {
+            let row = &self.weights.joint_out_w[d * hidden_dim..(d + 1) * hidden_dim];
+            let mut acc = self.weights.joint_out_b[d];
+            for i in 0..hidden_dim {
+                acc += row[i] * act[i];
+            }
+            if d < vocab_with_blank {
+                labels[d] = acc;
+            } else {
+                durations[d - vocab_with_blank] = acc;
+            }
+        }
+        (labels, durations)
     }
 
     fn project_pred(&self, pred: &[f32]) -> Vec<f32> {
@@ -463,6 +684,46 @@ impl Asr {
         }
         cleaned.trim_end().to_string()
     }
+}
+
+/// Turn logits into log-probabilities in place.
+fn log_softmax(values: &mut [f32]) {
+    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for v in values.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    let log_sum = sum.ln();
+    for v in values.iter_mut() {
+        *v = v.ln() - log_sum;
+    }
+}
+
+fn argmax(values: &[f32]) -> usize {
+    let mut best = 0usize;
+    let mut best_value = f32::NEG_INFINITY;
+    for (i, &value) in values.iter().enumerate() {
+        if value > best_value {
+            best_value = value;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Completed hypotheses kept for the right-context rescoring. The beam has
+/// already ranked them by acoustic score, so a handful of near-ties is enough
+/// for a learned continuation to break one.
+const NBEST: usize = 8;
+
+fn keep_best(found: &mut Vec<(f32, Vec<usize>)>, score: f32, emitted: Vec<usize>) {
+    if found.iter().any(|(_, other)| *other == emitted) {
+        return;
+    }
+    found.push((score, emitted));
+    found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    found.truncate(NBEST);
 }
 
 fn tensor_f32(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
